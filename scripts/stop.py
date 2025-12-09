@@ -5,6 +5,7 @@ This hook fires at the end of Claude's turn. If files were modified
 during the turn, it blocks and instructs Claude to spawn the
 memory-updater agent for CLAUDE.md updates.
 """
+
 import json
 import os
 import sys

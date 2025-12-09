@@ -12,6 +12,7 @@ Supports configurable trigger modes:
 When a git commit is detected, enriches each file path with inline commit
 context: /path/to/file [hash: commit message]
 """
+
 from __future__ import annotations
 
 import json
@@ -106,14 +107,55 @@ def extract_files_from_bash(command: str, project_dir: str) -> list[str]:
 
     # Skip commands that don't modify files
     skip_prefixes = (
-        "ls", "cat", "echo", "grep", "find", "head", "tail", "less", "more",
-        "cd", "pwd", "which", "whereis", "type", "file", "stat", "wc",
-        "git status", "git log", "git diff", "git show", "git branch",
-        "git fetch", "git pull", "git push", "git clone", "git checkout",
-        "git stash", "git remote", "git tag", "git rev-parse",
-        "npm ", "yarn ", "pnpm ", "node ", "python", "pip ", "uv ",
-        "cargo ", "go ", "make", "cmake", "docker ", "kubectl ",
-        "curl ", "wget ", "ssh ", "scp ", "rsync ",
+        "ls",
+        "cat",
+        "echo",
+        "grep",
+        "find",
+        "head",
+        "tail",
+        "less",
+        "more",
+        "cd",
+        "pwd",
+        "which",
+        "whereis",
+        "type",
+        "file",
+        "stat",
+        "wc",
+        "git status",
+        "git log",
+        "git diff",
+        "git show",
+        "git branch",
+        "git fetch",
+        "git pull",
+        "git push",
+        "git clone",
+        "git checkout",
+        "git stash",
+        "git remote",
+        "git tag",
+        "git rev-parse",
+        "npm ",
+        "yarn ",
+        "pnpm ",
+        "node ",
+        "python",
+        "pip ",
+        "uv ",
+        "cargo ",
+        "go ",
+        "make",
+        "cmake",
+        "docker ",
+        "kubectl ",
+        "curl ",
+        "wget ",
+        "ssh ",
+        "scp ",
+        "rsync ",
     )
     if command.startswith(skip_prefixes):
         return []
