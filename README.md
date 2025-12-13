@@ -42,8 +42,8 @@ Claude Code edits code -> Plugin tracks changes -> Isolated agent updates memory
 ### From Marketplace
 
 ```bash
-claude plugin marketplace add severity1/claude-code-marketplace
-claude plugin install auto-memory@claude-code-marketplace
+claude plugin marketplace add severity1/severity1-marketplace
+claude plugin install auto-memory@severity1-marketplace
 ```
 
 ### Local Development
