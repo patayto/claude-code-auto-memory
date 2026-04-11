@@ -4,16 +4,15 @@ Tests internal functions directly (no subprocess), complementing the
 subprocess-based integration tests in test_hooks.py.
 """
 
+import importlib
 import json
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
-# Import trigger.py module
+# Make scripts/ importable so we can load trigger.py as a module.
 SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
-import importlib
-
 trigger = importlib.import_module("trigger")
 sys.path.pop(0)
 
@@ -290,10 +289,12 @@ class TestEventRouting:
         (config_dir / "config.json").write_text(json.dumps({"triggerMode": "gitmode"}))
         (config_dir / "dirty-files").write_text("/file.py\n")
 
-        stdin_data = json.dumps({
-            "hook_event_name": "PreToolUse",
-            "tool_input": {"command": "git commit -m 'test'"},
-        })
+        stdin_data = json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_input": {"command": "git commit -m 'test'"},
+            }
+        )
         with (
             patch.dict("os.environ", {"CLAUDE_PROJECT_DIR": str(tmp_path)}),
             patch("sys.stdin") as mock_stdin,
