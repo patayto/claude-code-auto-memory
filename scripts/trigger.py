@@ -17,15 +17,30 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 
-def load_config(project_dir: str) -> dict:
+def plugin_initialized(project_dir: str) -> bool:
+    """Return True if the plugin has been initialized for this project.
+
+    The presence of .claude/auto-memory/config.json is the explicit
+    opt-in marker - users create it by running /auto-memory:init. On
+    projects without config.json we keep the plugin entirely inert:
+    no Stop-hook blocking, no PreToolUse interception, no memory-updater
+    agent spawn. This prevents auto-memory from intruding on projects
+    where the user never opted in (#17).
+    """
+    return (Path(project_dir) / ".claude" / "auto-memory" / "config.json").exists()
+
+
+def load_config(project_dir: str) -> dict[str, Any]:
     """Load plugin configuration from .claude/auto-memory/config.json."""
     config_file = Path(project_dir) / ".claude" / "auto-memory" / "config.json"
     if config_file.exists():
         try:
             with open(config_file) as f:
-                return json.load(f)
+                data: dict[str, Any] = json.load(f)
+                return data
         except (json.JSONDecodeError, OSError):
             pass
     return {"triggerMode": "default"}
@@ -67,10 +82,14 @@ def build_spawn_reason(files: list[str]) -> str:
     )
 
 
-def handle_stop(input_data: dict, project_dir: str) -> None:
+def handle_stop(input_data: dict[str, Any], project_dir: str) -> None:
     """Handle Stop hook event."""
     # Prevent infinite loop when stop_hook_active is set
     if input_data.get("stop_hook_active", False):
+        return
+
+    # Skip entirely on projects where the user hasn't run /auto-memory:init
+    if not plugin_initialized(project_dir):
         return
 
     config = load_config(project_dir)
@@ -105,14 +124,12 @@ def clear_dirty_files(project_dir: str) -> None:
 def handle_subagent_stop(project_dir: str) -> None:
     """Handle SubagentStop hook event.
 
-    Clears dirty-files after the memory-updater agent completes. Scoped to
-    our plugin by checking that both config.json exists (plugin active) and
-    dirty-files is non-empty (there's something to clean up).
+    Clears dirty-files after the memory-updater agent completes. Gated on
+    dirty-files presence alone - we intentionally do not require
+    config.json to exist, because doing so caused an infinite Stop-hook
+    loop on uninitialized projects (#17, #25): the Stop hook would
+    re-fire every turn on stale dirty-files that never got cleared.
     """
-    config_file = Path(project_dir) / ".claude" / "auto-memory" / "config.json"
-    if not config_file.exists():
-        return
-
     files = read_dirty_files(project_dir)
     if not files:
         return
@@ -120,12 +137,16 @@ def handle_subagent_stop(project_dir: str) -> None:
     clear_dirty_files(project_dir)
 
 
-def handle_pre_tool_use(input_data: dict, project_dir: str) -> None:
+def handle_pre_tool_use(input_data: dict[str, Any], project_dir: str) -> None:
     """Handle PreToolUse hook event.
 
     Only active in gitmode. Denies git commit commands when dirty files
     exist, forcing the memory-updater to run first.
     """
+    # Skip entirely on projects where the user hasn't run /auto-memory:init
+    if not plugin_initialized(project_dir):
+        return
+
     config = load_config(project_dir)
     trigger_mode = config.get("triggerMode", "default")
 
@@ -160,12 +181,13 @@ def handle_pre_tool_use(input_data: dict, project_dir: str) -> None:
     print(json.dumps(output))
 
 
-def main():
+def main() -> None:
     project_dir = os.environ.get("CLAUDE_PROJECT_DIR", "")
     if not project_dir:
         return
 
     # Read stdin JSON to determine which hook event fired
+    input_data: dict[str, Any]
     try:
         input_data = json.loads(sys.stdin.read())
     except json.JSONDecodeError:
