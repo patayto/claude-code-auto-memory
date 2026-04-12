@@ -71,14 +71,16 @@ tests/
 
 Data flow:
 1. User edits files via Edit/Write tools or git operations (rm, mv)
-2. PostToolUse hook appends paths to `.claude/auto-memory/dirty-files`
+2. PostToolUse hook appends paths to session-specific `.claude/auto-memory/dirty-files-{session_id}` (falls back to `dirty-files` without session_id)
 3. PreToolUse hook (gitmode only) denies git commit until dirty files processed
 4. Stop hook detects dirty files, blocks Claude, requests agent spawn
 5. memory-updater agent processes files and updates CLAUDE.md
-6. SubagentStop hook clears dirty-files after agent completes
+6. SubagentStop hook auto-commits CLAUDE.md (if configured), clears dirty-files, cleans up stale session files
 
 Configuration:
 - Trigger modes: `default` (after every turn) or `gitmode` (only after git commits)
+- `autoCommit`: When true, auto-commits CLAUDE.md changes after memory-updater completes
+- `autoPush`: When true (requires autoCommit), pushes commits to remote
 - Config stored in `.claude/auto-memory/config.json`
 
 <!-- END AUTO-MANAGED -->
@@ -105,11 +107,13 @@ Configuration:
 - **Initialization Guard Pattern**: `plugin_initialized()` in post-tool-use.py, handle_stop(), and handle_pre_tool_use() gates all activity on config.json existence — projects that never ran /auto-memory:init are fully inert
 - **Hook Lifecycle Pattern**: PostToolUse tracks → Stop/PreToolUse blocks → Agent spawns → SubagentStop cleans up (cleanup gated on dirty-files only, not config.json, to prevent infinite loops)
 - **Separation of Concerns**: PostToolUse (silent tracking) vs Stop/PreToolUse (blocking with output) vs SubagentStop (cleanup)
-- **Dirty File Pattern**: Append-only tracking, batch processing at turn end
+- **Dirty File Pattern**: Append-only tracking, batch processing at turn end, session-isolated via `dirty-files-{session_id}`
 - **Skill Pattern**: YAML frontmatter + markdown body with algorithm sections
 - **Template Pattern**: AUTO-MANAGED markers for updatable sections
-- **Config Pattern**: JSON config in `.claude/auto-memory/config.json`
+- **Config Pattern**: JSON config in `.claude/auto-memory/config.json` with `triggerMode`, `autoCommit`, `autoPush`
 - **Inline Commit Context**: Commit hash and message stored inline with file paths in dirty-files (`/path/to/file [hash: message]`)
+- **Session Isolation Pattern**: `session_id` from hook stdin JSON used to scope dirty-files per session, with fallback to shared file for backwards compatibility
+- **Stale Session Cleanup Pattern**: `cleanup_stale_session_files()` removes orphaned session dirty-files older than 24h on each SubagentStop
 
 <!-- END AUTO-MANAGED -->
 
@@ -129,6 +133,10 @@ Recent design decisions from commit history:
 - SubagentStop cleanup gated on dirty-files only (not config.json): requiring config.json caused infinite Stop-hook loops on uninitialized projects where dirty-files never got cleared
 - Initialization guard added (#17): plugin_initialized() check in PostToolUse, Stop, and PreToolUse keeps the plugin fully inert on projects that never ran /auto-memory:init
 - Type annotations tightened: dict[str, Any] generics, typed main() -> None, narrowed handle_git_commit return type
+- Session-aware dirty-files (#16): session_id from hook stdin JSON scopes dirty-files per session, preventing cross-session interference in concurrent workflows
+- Auto-commit/push toggle (#18): autoCommit and autoPush config options in SubagentStop handler, commits only CLAUDE.md files with graceful failure handling
+- handle_subagent_stop signature changed from (project_dir) to (input_data, project_dir) to receive session_id and support auto-commit config loading
+- SubagentStop cleanup fix (#28/#29): build_spawn_reason() now explicitly passes subagent_type='auto-memory:memory-updater' in Task tool spawn instructions - omitting it caused SubagentStop to not fire and dirty-files to never be cleared
 
 <!-- END AUTO-MANAGED -->
 
