@@ -390,6 +390,50 @@ class TestPostToolUseHook:
         dirty_file = tmp_path / ".claude" / "auto-memory" / "dirty-files"
         assert not dirty_file.exists()
 
+    def test_writes_session_specific_dirty_file(self, tmp_path):
+        """With session_id in stdin JSON, writes to dirty-files-{session_id}."""
+        self._init_config(tmp_path)
+        file_path = str(tmp_path / "feature.py")
+        stdin_data = json.dumps(
+            {
+                "tool_name": "Edit",
+                "tool_input": {"file_path": file_path},
+                "session_id": "sess-abc-123",
+            }
+        )
+        env = {"CLAUDE_PROJECT_DIR": str(tmp_path)}
+        result = subprocess.run(
+            [sys.executable, SCRIPTS_DIR / "post-tool-use.py"],
+            env={**os.environ, **env},
+            input=stdin_data,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        session_dirty = tmp_path / ".claude" / "auto-memory" / "dirty-files-sess-abc-123"
+        assert session_dirty.exists()
+        assert file_path in session_dirty.read_text()
+        # Plain dirty-files should NOT exist
+        plain_dirty = tmp_path / ".claude" / "auto-memory" / "dirty-files"
+        assert not plain_dirty.exists()
+
+    def test_falls_back_to_plain_dirty_file(self, tmp_path):
+        """Without session_id, writes to plain dirty-files."""
+        self._init_config(tmp_path)
+        file_path = str(tmp_path / "legacy.py")
+        env = {"CLAUDE_PROJECT_DIR": str(tmp_path)}
+        result = subprocess.run(
+            [sys.executable, SCRIPTS_DIR / "post-tool-use.py"],
+            env={**os.environ, **env},
+            input=self._make_tool_input(file_path),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        plain_dirty = tmp_path / ".claude" / "auto-memory" / "dirty-files"
+        assert plain_dirty.exists()
+        assert file_path in plain_dirty.read_text()
+
 
 class TestStopHook:
     """Tests for trigger.py Stop hook behavior."""
@@ -767,6 +811,96 @@ class TestSubagentStopHook:
         assert result.returncode == 0
         assert result.stdout == ""
         assert dirty_file.read_text() == ""
+
+    def test_clears_session_specific_dirty_file(self, tmp_path):
+        """With session_id, clears only that session's dirty-file."""
+        config_dir = tmp_path / ".claude" / "auto-memory"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(json.dumps({"triggerMode": "default"}))
+        (config_dir / "dirty-files-sess-int").write_text("/a.py\n")
+        (config_dir / "dirty-files-sess-other").write_text("/b.py\n")
+
+        env = {"CLAUDE_PROJECT_DIR": str(tmp_path)}
+        result = subprocess.run(
+            [sys.executable, SCRIPTS_DIR / "trigger.py"],
+            env={**os.environ, **env},
+            input=json.dumps(
+                {
+                    "hook_event_name": "SubagentStop",
+                    "session_id": "sess-int",
+                }
+            ),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert result.stdout == ""
+        assert (config_dir / "dirty-files-sess-int").read_text() == ""
+        assert (config_dir / "dirty-files-sess-other").read_text() == "/b.py\n"
+
+    def test_auto_commit_on_subagent_stop(self, tmp_path):
+        """With autoCommit config, commits CLAUDE.md after agent completes."""
+        # Set up git repo
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        (tmp_path / ".gitkeep").write_text("")
+        subprocess.run(["git", "add", ".gitkeep"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Initial commit"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+
+        # Set up config with autoCommit
+        config_dir = tmp_path / ".claude" / "auto-memory"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(
+            json.dumps({"triggerMode": "default", "autoCommit": True})
+        )
+
+        # Create and commit CLAUDE.md, then modify it
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text("# Initial")
+        subprocess.run(["git", "add", "CLAUDE.md"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add CLAUDE.md"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        claude_md.write_text("# Updated by memory-updater")
+
+        # Write dirty-files so SubagentStop has something to process
+        (config_dir / "dirty-files").write_text("/some/file.py\n")
+
+        env = {"CLAUDE_PROJECT_DIR": str(tmp_path)}
+        result = subprocess.run(
+            [sys.executable, SCRIPTS_DIR / "trigger.py"],
+            env={**os.environ, **env},
+            input=json.dumps({"hook_event_name": "SubagentStop"}),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert result.stdout == ""
+
+        # Verify CLAUDE.md was committed
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%s"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        assert "CLAUDE.md" in log.stdout
+        assert "[auto-memory]" in log.stdout
 
 
 class TestGitCommitContext:

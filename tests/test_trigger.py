@@ -6,7 +6,10 @@ subprocess-based integration tests in test_hooks.py.
 
 import importlib
 import json
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +18,28 @@ SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 trigger = importlib.import_module("trigger")
 sys.path.pop(0)
+
+
+class TestDirtyFilePath:
+    """Tests for dirty_file_path - returns session-specific or default dirty-files path."""
+
+    def test_returns_session_specific_path(self, tmp_path):
+        """With session_id, returns dirty-files-{session_id}."""
+        result = trigger.dirty_file_path(str(tmp_path), "abc-123")
+        expected = Path(tmp_path) / ".claude" / "auto-memory" / "dirty-files-abc-123"
+        assert result == expected
+
+    def test_returns_default_path_without_session(self, tmp_path):
+        """Without session_id, returns plain dirty-files."""
+        result = trigger.dirty_file_path(str(tmp_path))
+        expected = Path(tmp_path) / ".claude" / "auto-memory" / "dirty-files"
+        assert result == expected
+
+    def test_returns_default_path_with_empty_session(self, tmp_path):
+        """Empty string session_id returns plain dirty-files."""
+        result = trigger.dirty_file_path(str(tmp_path), "")
+        expected = Path(tmp_path) / ".claude" / "auto-memory" / "dirty-files"
+        assert result == expected
 
 
 class TestLoadConfig:
@@ -53,6 +78,28 @@ class TestLoadConfig:
 
         config = trigger.load_config(str(tmp_path))
         assert config["customField"] == "value"
+
+    def test_default_auto_commit_false(self, tmp_path):
+        """Default config does not include autoCommit (treated as false)."""
+        config = trigger.load_config(str(tmp_path))
+        assert config.get("autoCommit", False) is False
+
+    def test_default_auto_push_false(self, tmp_path):
+        """Default config does not include autoPush (treated as false)."""
+        config = trigger.load_config(str(tmp_path))
+        assert config.get("autoPush", False) is False
+
+    def test_reads_auto_commit_config(self, tmp_path):
+        """Reads autoCommit and autoPush from config file."""
+        config_dir = tmp_path / ".claude" / "auto-memory"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(
+            json.dumps({"triggerMode": "default", "autoCommit": True, "autoPush": True})
+        )
+
+        config = trigger.load_config(str(tmp_path))
+        assert config["autoCommit"] is True
+        assert config["autoPush"] is True
 
 
 class TestPluginInitialized:
@@ -151,6 +198,28 @@ class TestReadDirtyFiles:
         files = trigger.read_dirty_files(str(tmp_path))
         assert files == ["/a.py", "/b.py"]
 
+    def test_reads_session_specific_file(self, tmp_path):
+        """Reads from dirty-files-{session_id} when session_id provided."""
+        session_dir = tmp_path / ".claude" / "auto-memory"
+        session_dir.mkdir(parents=True)
+        (session_dir / "dirty-files-sess-001").write_text("/src/a.py\n")
+        # Also create a plain dirty-files with different content
+        (session_dir / "dirty-files").write_text("/src/b.py\n")
+
+        files = trigger.read_dirty_files(str(tmp_path), session_id="sess-001")
+        assert files == ["/src/a.py"]
+
+    def test_ignores_other_session_files(self, tmp_path):
+        """Only reads own session's file, not other sessions'."""
+        session_dir = tmp_path / ".claude" / "auto-memory"
+        session_dir.mkdir(parents=True)
+        (session_dir / "dirty-files-sess-001").write_text("/src/a.py\n")
+        (session_dir / "dirty-files-sess-002").write_text("/src/b.py\n")
+
+        files = trigger.read_dirty_files(str(tmp_path), session_id="sess-001")
+        assert files == ["/src/a.py"]
+        assert "/src/b.py" not in files
+
 
 class TestBuildSpawnReason:
     """Tests for build_spawn_reason - constructs agent spawn instruction."""
@@ -224,6 +293,19 @@ class TestHandleStop:
 
         trigger.handle_stop({}, str(tmp_path))
         assert capsys.readouterr().out == ""
+
+    def test_reads_session_specific_dirty_files(self, tmp_path, capsys):
+        """Passes session_id through to read session-specific dirty-files."""
+        config_dir = tmp_path / ".claude" / "auto-memory"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(json.dumps({"triggerMode": "default"}))
+        # Session-specific file has content, plain file does not
+        (config_dir / "dirty-files-sess-xyz").write_text("/src/main.py\n")
+
+        trigger.handle_stop({"session_id": "sess-xyz"}, str(tmp_path))
+        output = json.loads(capsys.readouterr().out)
+        assert output["decision"] == "block"
+        assert "/src/main.py" in output["reason"]
 
 
 class TestHandlePreToolUse:
@@ -409,6 +491,33 @@ class TestEventRouting:
         dirty = config_dir / "dirty-files"
         assert dirty.read_text() == ""
 
+    def test_routes_subagent_stop_with_session_id(self, tmp_path):
+        """SubagentStop passes input_data (including session_id) to handler."""
+        config_dir = tmp_path / ".claude" / "auto-memory"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(json.dumps({"triggerMode": "default"}))
+        (config_dir / "dirty-files-sess-route").write_text("/file.py\n")
+        # Plain dirty-files should NOT be touched
+        (config_dir / "dirty-files").write_text("/other.py\n")
+
+        stdin_data = json.dumps(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": "sess-route",
+            }
+        )
+        with (
+            patch.dict("os.environ", {"CLAUDE_PROJECT_DIR": str(tmp_path)}),
+            patch("sys.stdin") as mock_stdin,
+            patch("builtins.print") as mock_print,
+        ):
+            mock_stdin.read.return_value = stdin_data
+            trigger.main()
+            mock_print.assert_not_called()
+
+        assert (config_dir / "dirty-files-sess-route").read_text() == ""
+        assert (config_dir / "dirty-files").read_text() == "/other.py\n"
+
 
 class TestClearDirtyFiles:
     """Tests for clear_dirty_files - truncates dirty-files."""
@@ -428,6 +537,30 @@ class TestClearDirtyFiles:
         dirty = tmp_path / ".claude" / "auto-memory" / "dirty-files"
         assert not dirty.exists()
 
+    def test_clears_session_specific_file(self, tmp_path):
+        """Clears only dirty-files-{session_id} when session_id provided."""
+        session_dir = tmp_path / ".claude" / "auto-memory"
+        session_dir.mkdir(parents=True)
+        (session_dir / "dirty-files-sess-001").write_text("/src/a.py\n")
+        (session_dir / "dirty-files-sess-002").write_text("/src/b.py\n")
+
+        trigger.clear_dirty_files(str(tmp_path), session_id="sess-001")
+        assert (session_dir / "dirty-files-sess-001").read_text() == ""
+        assert (session_dir / "dirty-files-sess-002").read_text() == "/src/b.py\n"
+
+    def test_leaves_other_session_files(self, tmp_path):
+        """Other sessions' dirty-files are untouched when clearing with session_id."""
+        session_dir = tmp_path / ".claude" / "auto-memory"
+        session_dir.mkdir(parents=True)
+        (session_dir / "dirty-files-sess-A").write_text("/a.py\n")
+        (session_dir / "dirty-files-sess-B").write_text("/b.py\n")
+        (session_dir / "dirty-files").write_text("/c.py\n")
+
+        trigger.clear_dirty_files(str(tmp_path), session_id="sess-A")
+        assert (session_dir / "dirty-files-sess-A").read_text() == ""
+        assert (session_dir / "dirty-files-sess-B").read_text() == "/b.py\n"
+        assert (session_dir / "dirty-files").read_text() == "/c.py\n"
+
 
 class TestHandleSubagentStop:
     """Tests for handle_subagent_stop - SubagentStop hook event handler."""
@@ -440,7 +573,7 @@ class TestHandleSubagentStop:
         dirty = config_dir / "dirty-files"
         dirty.write_text("/src/main.py\n/src/util.py\n")
 
-        trigger.handle_subagent_stop(str(tmp_path))
+        trigger.handle_subagent_stop({}, str(tmp_path))
         assert dirty.read_text() == ""
 
     def test_clears_even_when_config_missing(self, tmp_path):
@@ -455,7 +588,7 @@ class TestHandleSubagentStop:
         dirty = dirty_dir / "dirty-files"
         dirty.write_text("/file.py\n")
 
-        trigger.handle_subagent_stop(str(tmp_path))
+        trigger.handle_subagent_stop({}, str(tmp_path))
         assert dirty.read_text() == ""
 
     def test_noop_when_dirty_files_empty(self, tmp_path):
@@ -466,7 +599,7 @@ class TestHandleSubagentStop:
         dirty = config_dir / "dirty-files"
         dirty.write_text("")
 
-        trigger.handle_subagent_stop(str(tmp_path))
+        trigger.handle_subagent_stop({}, str(tmp_path))
         assert dirty.read_text() == ""
 
     def test_noop_when_dirty_files_missing(self, tmp_path):
@@ -475,7 +608,7 @@ class TestHandleSubagentStop:
         config_dir.mkdir(parents=True)
         (config_dir / "config.json").write_text(json.dumps({"triggerMode": "default"}))
 
-        trigger.handle_subagent_stop(str(tmp_path))
+        trigger.handle_subagent_stop({}, str(tmp_path))
         dirty = config_dir / "dirty-files"
         assert not dirty.exists()
 
@@ -486,5 +619,269 @@ class TestHandleSubagentStop:
         (config_dir / "config.json").write_text(json.dumps({"triggerMode": "default"}))
         (config_dir / "dirty-files").write_text("/file.py\n")
 
-        trigger.handle_subagent_stop(str(tmp_path))
+        trigger.handle_subagent_stop({}, str(tmp_path))
         assert capsys.readouterr().out == ""
+
+    def test_clears_session_specific_file(self, tmp_path):
+        """Clears only own session's dirty-files when session_id provided."""
+        config_dir = tmp_path / ".claude" / "auto-memory"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(json.dumps({"triggerMode": "default"}))
+        (config_dir / "dirty-files-sess-A").write_text("/a.py\n")
+        (config_dir / "dirty-files-sess-B").write_text("/b.py\n")
+
+        trigger.handle_subagent_stop({"session_id": "sess-A"}, str(tmp_path))
+        assert (config_dir / "dirty-files-sess-A").read_text() == ""
+        assert (config_dir / "dirty-files-sess-B").read_text() == "/b.py\n"
+
+
+class TestCleanupStaleSessions:
+    """Tests for cleanup_stale_session_files - removes orphaned session dirty-files."""
+
+    def test_removes_old_session_files(self, tmp_path):
+        """Removes session-specific dirty-files older than max_age_hours."""
+        session_dir = tmp_path / ".claude" / "auto-memory"
+        session_dir.mkdir(parents=True)
+        stale = session_dir / "dirty-files-old-session"
+        stale.write_text("/stale.py\n")
+        # Set mtime to 25 hours ago
+        old_time = time.time() - (25 * 3600)
+        os.utime(stale, (old_time, old_time))
+
+        trigger.cleanup_stale_session_files(str(tmp_path), max_age_hours=24)
+        assert not stale.exists()
+
+    def test_keeps_recent_session_files(self, tmp_path):
+        """Keeps session-specific dirty-files younger than max_age_hours."""
+        session_dir = tmp_path / ".claude" / "auto-memory"
+        session_dir.mkdir(parents=True)
+        recent = session_dir / "dirty-files-recent-session"
+        recent.write_text("/recent.py\n")
+        # mtime is now (just created), well within 24h
+
+        trigger.cleanup_stale_session_files(str(tmp_path), max_age_hours=24)
+        assert recent.exists()
+        assert recent.read_text() == "/recent.py\n"
+
+    def test_keeps_plain_dirty_files(self, tmp_path):
+        """Never removes the legacy plain dirty-files (no session suffix)."""
+        session_dir = tmp_path / ".claude" / "auto-memory"
+        session_dir.mkdir(parents=True)
+        plain = session_dir / "dirty-files"
+        plain.write_text("/legacy.py\n")
+        # Make it old
+        old_time = time.time() - (48 * 3600)
+        os.utime(plain, (old_time, old_time))
+
+        trigger.cleanup_stale_session_files(str(tmp_path), max_age_hours=24)
+        assert plain.exists()
+        assert plain.read_text() == "/legacy.py\n"
+
+    def test_noop_when_no_session_files(self, tmp_path):
+        """No crash when directory has no session files."""
+        session_dir = tmp_path / ".claude" / "auto-memory"
+        session_dir.mkdir(parents=True)
+
+        trigger.cleanup_stale_session_files(str(tmp_path), max_age_hours=24)
+        # Should not raise
+
+    def test_noop_when_directory_missing(self, tmp_path):
+        """No crash when .claude/auto-memory directory doesn't exist."""
+        trigger.cleanup_stale_session_files(str(tmp_path), max_age_hours=24)
+        # Should not raise
+
+
+class TestAutoCommitClaudeMd:
+    """Tests for auto_commit_claude_md - stages and commits CLAUDE.md files."""
+
+    def _init_git_repo(self, tmp_path):
+        """Initialize a git repo with an initial commit."""
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        init_file = tmp_path / ".gitkeep"
+        init_file.write_text("")
+        subprocess.run(["git", "add", ".gitkeep"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Initial commit"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+
+    def test_commits_modified_claude_md(self, tmp_path):
+        """Stages and commits modified CLAUDE.md files."""
+        self._init_git_repo(tmp_path)
+        # Create and commit CLAUDE.md initially
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text("# Initial")
+        subprocess.run(["git", "add", "CLAUDE.md"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add CLAUDE.md"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        # Modify CLAUDE.md (simulating memory-updater)
+        claude_md.write_text("# Updated by auto-memory")
+
+        result = trigger.auto_commit_claude_md(str(tmp_path))
+        assert result is True
+
+        # Verify commit was made
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%s"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        assert "CLAUDE.md" in log.stdout
+        assert "[auto-memory]" in log.stdout
+
+    def test_noop_when_no_claude_md_changes(self, tmp_path):
+        """Returns False when no CLAUDE.md files are modified."""
+        self._init_git_repo(tmp_path)
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text("# Clean")
+        subprocess.run(["git", "add", "CLAUDE.md"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add CLAUDE.md"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+
+        result = trigger.auto_commit_claude_md(str(tmp_path))
+        assert result is False
+
+    def test_commit_message_format(self, tmp_path):
+        """Commit message matches expected format."""
+        self._init_git_repo(tmp_path)
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text("# Initial")
+        subprocess.run(["git", "add", "CLAUDE.md"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add CLAUDE.md"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        claude_md.write_text("# Updated")
+
+        trigger.auto_commit_claude_md(str(tmp_path))
+
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%s"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        assert log.stdout.strip() == "chore: update CLAUDE.md [auto-memory]"
+
+    def test_only_commits_claude_md_files(self, tmp_path):
+        """Other modified files are not included in the commit."""
+        self._init_git_repo(tmp_path)
+        # Create and commit both files
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text("# Initial")
+        other = tmp_path / "other.py"
+        other.write_text("# other")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add files"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        # Modify both
+        claude_md.write_text("# Updated")
+        other.write_text("# modified")
+
+        trigger.auto_commit_claude_md(str(tmp_path))
+
+        # other.py should still show as modified (not committed)
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        assert "other.py" in status.stdout
+
+    def test_returns_false_on_git_failure(self, tmp_path):
+        """Returns False when not in a git repo (graceful failure)."""
+        # tmp_path is not a git repo
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text("# Not a repo")
+
+        result = trigger.auto_commit_claude_md(str(tmp_path))
+        assert result is False
+
+    def test_commits_subtree_claude_md(self, tmp_path):
+        """Commits CLAUDE.md files in subdirectories too."""
+        self._init_git_repo(tmp_path)
+        # Create root and subtree CLAUDE.md
+        root_md = tmp_path / "CLAUDE.md"
+        root_md.write_text("# Root")
+        sub_dir = tmp_path / "src"
+        sub_dir.mkdir()
+        sub_md = sub_dir / "CLAUDE.md"
+        sub_md.write_text("# Sub")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add CLAUDE.md files"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        # Modify both
+        root_md.write_text("# Root updated")
+        sub_md.write_text("# Sub updated")
+
+        result = trigger.auto_commit_claude_md(str(tmp_path))
+        assert result is True
+
+        # Both should be committed
+        show = subprocess.run(
+            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        assert "CLAUDE.md" in show.stdout
+        assert "src/CLAUDE.md" in show.stdout
+
+
+class TestAutoPush:
+    """Tests for auto_push - pushes current branch to remote."""
+
+    def test_returns_false_on_push_failure(self, tmp_path):
+        """Returns False when push fails (no remote configured)."""
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        (tmp_path / ".gitkeep").write_text("")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Initial"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+
+        result = trigger.auto_push(str(tmp_path))
+        assert result is False
+
+    def test_returns_false_when_not_git_repo(self, tmp_path):
+        """Returns False when not in a git repo."""
+        result = trigger.auto_push(str(tmp_path))
+        assert result is False

@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -46,12 +48,20 @@ def load_config(project_dir: str) -> dict[str, Any]:
     return {"triggerMode": "default"}
 
 
-def read_dirty_files(project_dir: str) -> list[str]:
+def dirty_file_path(project_dir: str, session_id: str = "") -> Path:
+    """Return path to session-specific or default dirty-files."""
+    base = Path(project_dir) / ".claude" / "auto-memory"
+    if session_id:
+        return base / f"dirty-files-{session_id}"
+    return base / "dirty-files"
+
+
+def read_dirty_files(project_dir: str, session_id: str = "") -> list[str]:
     """Read and deduplicate dirty files, stripping commit context.
 
     Returns sorted list of file paths (max 20).
     """
-    dirty_file = Path(project_dir) / ".claude" / "auto-memory" / "dirty-files"
+    dirty_file = dirty_file_path(project_dir, session_id)
 
     if not dirty_file.exists() or dirty_file.stat().st_size == 0:
         return []
@@ -100,7 +110,8 @@ def handle_stop(input_data: dict[str, Any], project_dir: str) -> None:
     # (PreToolUse only intercepts before the next git commit, not after the last one)
     # So we don't skip Stop in gitmode - it acts as the final safety net.
 
-    files = read_dirty_files(project_dir)
+    session_id = input_data.get("session_id", "")
+    files = read_dirty_files(project_dir, session_id)
     if not files:
         return
 
@@ -115,14 +126,84 @@ def handle_stop(input_data: dict[str, Any], project_dir: str) -> None:
     print(json.dumps(output))
 
 
-def clear_dirty_files(project_dir: str) -> None:
+def clear_dirty_files(project_dir: str, session_id: str = "") -> None:
     """Truncate dirty-files to clear processed entries."""
-    dirty_file = Path(project_dir) / ".claude" / "auto-memory" / "dirty-files"
+    dirty_file = dirty_file_path(project_dir, session_id)
     if dirty_file.exists():
         dirty_file.write_text("")
 
 
-def handle_subagent_stop(project_dir: str) -> None:
+def cleanup_stale_session_files(project_dir: str, max_age_hours: int = 24) -> None:
+    """Remove session-specific dirty-files older than max_age_hours.
+
+    Only removes files matching dirty-files-* pattern. Never removes
+    the plain dirty-files (backwards compatibility).
+    """
+    auto_memory_dir = Path(project_dir) / ".claude" / "auto-memory"
+    if not auto_memory_dir.exists():
+        return
+
+    cutoff = time.time() - (max_age_hours * 3600)
+    for f in auto_memory_dir.glob("dirty-files-*"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def auto_commit_claude_md(project_dir: str) -> bool:
+    """Stage and commit modified CLAUDE.md files. Returns True on success."""
+    # Find modified CLAUDE.md files (tracked, unstaged changes)
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=M"],
+        capture_output=True,
+        text=True,
+        cwd=project_dir,
+    )
+    if result.returncode != 0:
+        return False
+
+    claude_files = [
+        f.strip()
+        for f in result.stdout.strip().split("\n")
+        if f.strip() and f.strip().endswith("CLAUDE.md")
+    ]
+    if not claude_files:
+        return False
+
+    # Stage only CLAUDE.md files
+    stage = subprocess.run(
+        ["git", "add"] + claude_files,
+        capture_output=True,
+        text=True,
+        cwd=project_dir,
+    )
+    if stage.returncode != 0:
+        return False
+
+    # Commit
+    commit = subprocess.run(
+        ["git", "commit", "-m", "chore: update CLAUDE.md [auto-memory]"],
+        capture_output=True,
+        text=True,
+        cwd=project_dir,
+    )
+    return commit.returncode == 0
+
+
+def auto_push(project_dir: str) -> bool:
+    """Push current branch to remote. Returns True on success."""
+    result = subprocess.run(
+        ["git", "push"],
+        capture_output=True,
+        text=True,
+        cwd=project_dir,
+    )
+    return result.returncode == 0
+
+
+def handle_subagent_stop(input_data: dict[str, Any], project_dir: str) -> None:
     """Handle SubagentStop hook event.
 
     Clears dirty-files after the memory-updater agent completes. Gated on
@@ -130,12 +211,24 @@ def handle_subagent_stop(project_dir: str) -> None:
     config.json to exist, because doing so caused an infinite Stop-hook
     loop on uninitialized projects (#17, #25): the Stop hook would
     re-fire every turn on stale dirty-files that never got cleared.
+
+    When autoCommit is enabled, commits modified CLAUDE.md files before
+    clearing dirty-files (#18).
     """
-    files = read_dirty_files(project_dir)
+    session_id = input_data.get("session_id", "")
+    files = read_dirty_files(project_dir, session_id)
     if not files:
         return
 
-    clear_dirty_files(project_dir)
+    # Auto-commit/push before clearing dirty files
+    config = load_config(project_dir)
+    if config.get("autoCommit", False):
+        if auto_commit_claude_md(project_dir):
+            if config.get("autoPush", False):
+                auto_push(project_dir)
+
+    clear_dirty_files(project_dir, session_id)
+    cleanup_stale_session_files(project_dir)
 
 
 def handle_pre_tool_use(input_data: dict[str, Any], project_dir: str) -> None:
@@ -161,7 +254,8 @@ def handle_pre_tool_use(input_data: dict[str, Any], project_dir: str) -> None:
     if "git commit" not in command:
         return
 
-    files = read_dirty_files(project_dir)
+    session_id = input_data.get("session_id", "")
+    files = read_dirty_files(project_dir, session_id)
     if not files:
         return
 
@@ -200,7 +294,7 @@ def main() -> None:
     if hook_event == "PreToolUse":
         handle_pre_tool_use(input_data, project_dir)
     elif hook_event == "SubagentStop":
-        handle_subagent_stop(project_dir)
+        handle_subagent_stop(input_data, project_dir)
     else:
         # Default to Stop behavior (for backwards compatibility and
         # when hook_event_name is missing or "Stop")

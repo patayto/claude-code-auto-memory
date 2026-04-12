@@ -87,6 +87,14 @@ def handle_git_commit(project_dir: str) -> tuple[list[str], dict[str, str] | Non
     return files, {"hash": commit_hash, "message": commit_message}
 
 
+def dirty_file_path(project_dir: str, session_id: str = "") -> Path:
+    """Return path to session-specific or default dirty-files."""
+    base = Path(project_dir) / ".claude" / "auto-memory"
+    if session_id:
+        return base / f"dirty-files-{session_id}"
+    return base / "dirty-files"
+
+
 def should_track(file_path: str, project_dir: str) -> bool:
     """Check if file should be tracked for CLAUDE.md updates."""
     path = Path(file_path)
@@ -266,6 +274,7 @@ def main() -> None:
 
     tool_name = tool_input.get("tool_name", "")
     tool_input_data = tool_input.get("tool_input", {})
+    session_id = tool_input.get("session_id", "")
 
     # Load configuration
     config = load_config(project_dir)
@@ -320,7 +329,7 @@ def main() -> None:
         return
 
     # Read existing dirty files into a dict (path -> full line)
-    dirty_file = Path(project_dir) / ".claude" / "auto-memory" / "dirty-files"
+    dirty_file = dirty_file_path(project_dir, session_id)
     dirty_file.parent.mkdir(parents=True, exist_ok=True)
     existing: dict[str, str] = {}
     if dirty_file.exists():

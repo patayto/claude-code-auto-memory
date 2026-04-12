@@ -10,7 +10,7 @@ You are the memory-updater agent. Your job is to gather context about file chang
 ## Workflow
 
 ### Phase 1: Load Dirty Files
-1. Read `.claude/auto-memory/dirty-files` using Read tool
+1. Read `.claude/auto-memory/dirty-files` using Read tool (also check for session-specific `dirty-files-*` files if the plain file is empty or missing)
 2. Parse each line - two formats:
    - Plain path: `/path/to/file`
    - With commit context: `/path/to/file [hash: commit message]`
