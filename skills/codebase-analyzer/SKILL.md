@@ -51,21 +51,14 @@ Analyze source files for conventions:
 - **Architecture**: Feature-based, layered, MVC patterns
 - **Style**: Indentation, quotes, semicolons
 
-### 5. Fetch Memory Guidelines (Optional)
-
-If network available, fetch from `https://code.claude.com/docs/en/memory`:
-- Use WebFetch tool
-- Extract relevant sections for context
-- Reference official guidelines above as primary source
-
-### 6. Present Findings
+### 5. Present Findings
 
 Use AskUserQuestion to confirm:
 - Detected framework and commands
 - Suggested subtree locations
 - Detected patterns
 
-### 7. Generate CLAUDE.md
+### 6. Generate CLAUDE.md
 
 Generate files using the EXACT template structure. Follow these steps precisely:
 
