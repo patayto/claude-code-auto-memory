@@ -1,7 +1,6 @@
 # Claude Code Memory Guidelines
 
-Follow the official Claude Code memory documentation:
-https://code.claude.com/docs/en/memory
+Follow the official Claude Code memory documentation.
 
 ## Memory Scope (This Plugin)
 
